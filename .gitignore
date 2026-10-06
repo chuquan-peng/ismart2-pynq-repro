@@ -1,0 +1,10 @@
+*.bit
+*.bin
+*.hwh
+*.cc
+*.jou
+*.log
+myproj/
+csim_proj/
+.Xil/
+!results/*.rpt
