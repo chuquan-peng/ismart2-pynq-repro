@@ -31,7 +31,22 @@
 > 说明：推理用的是一张合成测试图，**未做精度评估**，不含 mAP 数据，也未与原版在 DAC 数据集上的成绩作对比。本仓库只验证硬件通路可用。
 
 ---
+## 硬件结构
 
+![Block design](results/block_design.png)
+
+*本次构建的 block design。设计来自原作者；我在其中只改了 `FCLK_CLK0`（142.857 MHz → 83.333 MHz，见后文工具链问题第 2 条）。*
+
+- `processing_system7_0`：Zynq 的 PS（ARM 侧）。它输出的 `FCLK_CLK0` 是 PL 里唯一的时钟。
+- `mobilenet_0`：加速器，HLS 生成的 IP。
+- 控制通路：PS 的 `M_AXI_GP0` → `ps7_0_axi_periph` → `s_axi_AXILiteS`（寄存器表见后文）。
+- 数据通路：IP 的三个 AXI 主口（`m_axi_IMG`、`m_axi_INPUT_r`、`m_axi_OUTPUT_r`）→ 三个 AXI SmartConnect → PS 的 `S_AXI_HP0/1/2`，由此直接读写 DDR。
+
+![Device view](results/device_view.png)
+
+*实现后设计在 Vivado 器件视图中的布局（xc7z020clg400-1）。图中未显示布线。*
+
+---
 ## 性能瓶颈分析
 
 把上面两组数字放在一起看，能定位这个设计的瓶颈所在。
@@ -209,7 +224,7 @@ PYNQ-Z1 直连电脑时板子固定 IP 为 `192.168.2.99`，主机网卡配 `192
 ```
 notebook/   改写后的板上 host notebook（含运行输出）
 patches/    构建脚本的修复
-results/    时序与资源报告
+results/    时序与资源报告，结构图与器件视图截图
 ```
 
 ---

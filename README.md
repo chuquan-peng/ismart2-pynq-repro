@@ -31,7 +31,22 @@ Resource utilization (Zynq-7020):
 > Note: inference was run on a single synthetic test image. **No accuracy evaluation was performed** — there is no mAP figure here, and no comparison against the original results on the DAC dataset. This repository only verifies that the hardware datapath works.
 
 ---
+## Hardware Structure
 
+![Block design](results/block_design.png)
+
+*Block design as built here. The design is the original authors'; the only thing I changed in it is `FCLK_CLK0` (142.857 MHz → 83.333 MHz, see fix 2 below).*
+
+- `processing_system7_0`: the Zynq PS (ARM side). Its `FCLK_CLK0` is the only clock in the PL.
+- `mobilenet_0`: the accelerator, an HLS-generated IP.
+- Control: PS `M_AXI_GP0` → `ps7_0_axi_periph` → `s_axi_AXILiteS` (the registers listed under "Running on the Board").
+- Data: the IP's three AXI master ports (`m_axi_IMG`, `m_axi_INPUT_r`, `m_axi_OUTPUT_r`) → three AXI SmartConnects → PS `S_AXI_HP0/1/2`, i.e. straight into DDR.
+
+![Device view](results/device_view.png)
+
+*Placement of the implemented design in the Vivado device view (xc7z020clg400-1). Routing is not displayed.*
+
+---
 ## Bottleneck Analysis
 
 Reading the two tables above together locates where this design is actually limited.
@@ -209,7 +224,7 @@ When the PYNQ-Z1 is connected directly to a host, the board's fixed IP is `192.1
 ```
 notebook/   rewritten on-board host notebook (with execution output)
 patches/    build script fixes
-results/    timing and utilization reports
+results/    timing and utilization reports, block-design and device-view screenshots
 ```
 
 ---
