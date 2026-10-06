@@ -1,125 +1,127 @@
-# iSmart2 on PYNQ-Z1 — 复现记录
+# iSmart2 on PYNQ-Z1 — Reproduction Notes
 
-在 Vivado 2018.2 + PYNQ-Z1 上复现 iSmart2（DAC-SDC 2018 参赛的 MobileNet 目标检测加速器），完成从 HLS 综合到上板推理的完整闭环。
+*English · [简体中文](README.zh-CN.md)*
 
-本仓库**只包含复现过程中我自己的产出**：工具链问题的修复、改写的板上 host 代码、构建与运行结果。原工程的 HLS 源码与训练权重不在此处，请向原作者获取。
+Reproducing iSmart2 (a MobileNet object-detection accelerator from the DAC-SDC 2018 contest) on PYNQ-Z1 with Vivado 2018.2, from HLS synthesis all the way to on-board inference.
+
+This repository contains **only my own work**: toolchain fixes, a rewritten on-board host notebook, and build/run results. The original HLS sources and trained weights are not redistributed here — please obtain them from the original authors.
 
 ---
 
-## 结果
+## Results
 
-| 项目 | 数值 |
+| Item | Value |
 |---|---|
-| 目标板卡 | PYNQ-Z1（xc7z020clg400-1） |
-| 实现频率 | 83.333 MHz |
-| 时序 | WNS +0.068 ns，WHS +0.051 ns，0 failing endpoints |
-| 单帧延迟 | 198.7 ms |
-| 吞吐 | 5.0 FPS |
-| PYNQ 镜像 | v3.0.1 |
+| Target board | PYNQ-Z1 (xc7z020clg400-1) |
+| Achieved frequency | 83.333 MHz |
+| Timing | WNS +0.068 ns, WHS +0.051 ns, 0 failing endpoints |
+| Single-frame latency | 198.7 ms |
+| Throughput | 5.0 FPS |
+| PYNQ image | v3.0.1 |
 
-资源占用（Zynq-7020）：
+Resource utilization (Zynq-7020):
 
-| 资源 | 用量 | 占比 |
+| Resource | Used | Utilization |
 |---|---|---|
 | Slice LUTs | 30,710 / 53,200 | 57.73% |
 | Slice Registers | 20,370 / 106,400 | 19.14% |
 | Block RAM Tile | 132 / 140 | **94.29%** |
 | DSPs | 82 / 220 | 37.27% |
 
-> 说明：推理用的是一张合成测试图，**未做精度评估**，不含 mAP 数据，也未与原版在 DAC 数据集上的成绩作对比。本仓库只验证硬件通路可用。
+> Note: inference was run on a single synthetic test image. **No accuracy evaluation was performed** — there is no mAP figure here, and no comparison against the original results on the DAC dataset. This repository only verifies that the hardware datapath works.
 
 ---
 
-## 性能瓶颈分析
+## Bottleneck Analysis
 
-把上面两组数字放在一起看，能定位这个设计的瓶颈所在。
+Reading the two tables above together locates where this design is actually limited.
 
-### 实测延迟 vs 计算下界
+### Measured latency vs. compute lower bound
 
-先估一个纯计算的下界 —— 假设数据永远就绪、阵列永不空转：
+First, a pure-compute lower bound — assuming data is always ready and the array never stalls:
 
 ```
-计算下界 = 总 MAC 数 / (并行度 × 频率)
+compute lower bound = total MACs / (parallelism × frequency)
 ```
 
-- 总 MAC 数：MobileNet 在 320×160 输入下约 1×10⁸ 量级
-- 并行度：16（HLS 顶层函数名 `compute_engine_16`，权重数组按 `[N][16][16]` 分块）
-- 频率：83.333 MHz
+- Total MACs: roughly 1×10⁸ for MobileNet at 320×160 input
+- Parallelism: 16 (the HLS top function is named `compute_engine_16`; weight arrays are tiled as `[N][16][16]`)
+- Frequency: 83.333 MHz
 
 ```
 1e8 / (16 × 83.3e6) ≈ 75 ms
 ```
 
-实测 198.7 ms，是下界的约 **2.6 倍**。差出来的 ~120 ms 不在算术单元里，而在数据搬运与层间等待上。
+Measured latency is 198.7 ms — about **2.6×** the lower bound. The missing ~120 ms is not spent in the arithmetic units; it goes to data movement and inter-layer stalls.
 
-### 资源画像佐证
+### Resource profile supports this
 
-| 资源 | 占比 | 读法 |
+| Resource | Utilization | Reading |
 |---|---|---|
-| Block RAM | **94.29%** | 几乎用尽 |
-| DSP | 37.27% | 还剩近三分之二 |
-| LUT | 57.73% | 中等 |
+| Block RAM | **94.29%** | nearly exhausted |
+| DSP | 37.27% | roughly two thirds still free |
+| LUT | 57.73% | moderate |
 
-片上存储先于算力耗尽。BRAM 塞满意味着权重与中间特征图无法常驻片上，层与层之间必须反复经 DDR 中转 —— 每一次中转都是算术单元的空转周期。
+On-chip storage runs out well before compute does. With BRAM full, weights and intermediate feature maps cannot stay resident on chip, so layers must round-trip through DDR — and every round trip is idle time for the arithmetic units.
 
-### 推论
+### Conclusions
 
-这个设计是**访存受限（memory-bound）**，不是计算受限。两条推论：
+This design is **memory-bound**, not compute-bound. Two implications:
 
-1. 单纯提频或增加 DSP 并行度，收益会被访存带宽吃掉。时序上 83 MHz 的 WNS 只有 +0.068 ns，继续提频本身也已接近极限。
-2. 有效的方向在片上存储一侧：提高权重与特征图的复用率、改进分块（tiling）策略减少层间往返、或引入数据流调度让搬运与计算重叠。
+1. Simply raising the clock or adding DSP parallelism would see the gains absorbed by memory bandwidth. Frequency headroom is also nearly gone: WNS at 83 MHz is only +0.068 ns.
+2. The productive direction is on the storage side: improve reuse of weights and feature maps, revise the tiling strategy to cut inter-layer round trips, or introduce dataflow scheduling so that transfers overlap with computation.
 
-> 以上为基于本次构建数据的推断，未经进一步实验（如逐层周期拆分、DMA 带宽实测）验证。总 MAC 数为量级估算，非逐层精确统计。
+> The above is inferred from this build's data and has not been verified by further experiments (e.g. per-layer cycle breakdown, measured DMA bandwidth). The MAC count is an order-of-magnitude estimate, not a per-layer tally.
 
 ---
 
-## 工具链问题与修复
+## Toolchain Issues and Fixes
 
-### 1. `core_revision` 整数溢出 — Vivado 2018.2 `[IMPL 213-28]`
+### 1. `core_revision` integer overflow — Vivado 2018.2 `[IMPL 213-28]`
 
-HLS 导出 IP 时，revision 号由系统日期按 `YYMMDDHHMM` 生成。2022 年以后这个数值超出 int32 范围，导出失败。
+When HLS exports the IP, the revision number is generated from the system date as `YYMMDDHHMM`. From 2022 onward this exceeds the int32 range and the export fails.
 
-修复：让 HLS 导出先失败，改 `run_ippack.tcl` 第 64 行的 `set Revision` 为一个 2018 年的固定值（如 `1809132310`），再手动执行
+Fix: let the HLS export fail, edit line 64 of `run_ippack.tcl` (`set Revision`) to a fixed 2018-era value such as `1809132310`, then re-run manually:
 
 ```
 vivado -mode batch -source run_ippack.tcl
 ```
 
-把系统时钟改回 2018 年也能绕过，但会影响其他软件，不推荐。
+Setting the system clock back to 2018 also works around it, but affects everything else on the machine — not recommended.
 
-### 2. 时序不收敛
+### 2. Timing not met
 
-原工程 `FCLK_CLK0` 设为 142.857 MHz，而 HLS 是按 100 MHz 综合的（`ip/script.tcl` 里 `create_clock -period 10`）。实际可达频率约 83 MHz。
+The original project sets `FCLK_CLK0` to 142.857 MHz, while the HLS IP was synthesized at 100 MHz (`create_clock -period 10` in `ip/script.tcl`). The actually achievable frequency is around 83 MHz.
 
-修复：`overlay/design_1_wrapper.tcl` 里时钟改为 `83.333336` / `83`。83 MHz 下时序收敛，WNS +0.068 ns。
+Fix: change the clock in `overlay/design_1_wrapper.tcl` to `83.333336` / `83`. Timing closes at 83 MHz with WNS +0.068 ns.
 
-### 3. `build_all.tcl` 顶层模块名错误
+### 3. Wrong top module in `build_all.tcl`
 
-脚本里写死了 `tutorial_1_wrapper`，应为 `design_1_wrapper`。
+The script hardcodes `tutorial_1_wrapper`; it must be `design_1_wrapper`.
 
-### 4. HLS 重复触发
+### 4. HLS re-triggered on every build
 
-HLS 跑完之后再执行 `build_all.tcl` 会重新触发问题 1。`patches/build_nohls.tcl` 是去掉 HLS 步骤的精简版，直接从 IP 打包走到比特流。
+Running `build_all.tcl` after HLS has already completed re-triggers issue 1. `patches/build_nohls.tcl` is a stripped version that skips HLS and goes straight from IP packaging to bitstream.
 
-### 5. 其他
+### 5. Miscellaneous
 
-- 工程必须放在短路径（如 `C:\w\`），否则触碰 Windows 260 字符路径上限
-- PYNQ-Z1 的 board files 不在 Digilent 官方 vivado-boards 仓库，需从 [cathalmccabe/pynq-z1_board_files](https://github.com/cathalmccabe/pynq-z1_board_files) 获取
-- Vivado 2023.1 不可用：无 Zynq-7000 器件支持，且不含 `vivado_hls`
+- The project must live at a short path (e.g. `C:\w\`) to stay under the Windows 260-character path limit
+- PYNQ-Z1 board files are not in Digilent's official vivado-boards repo — get them from [cathalmccabe/pynq-z1_board_files](https://github.com/cathalmccabe/pynq-z1_board_files)
+- Vivado 2023.1 is unusable: no Zynq-7000 device support and no `vivado_hls`
 
 ---
 
-## 板上 host 代码的改写
+## Rewriting the On-Board Host Code
 
-原版 notebook 跑不起来，三处要改：
+The original notebook does not run as-is. Three changes were needed:
 
-### `Xlnk` 已被移除
+### `Xlnk` has been removed
 
-PYNQ v2.7 起 `pynq.Xlnk` 被 `pynq.allocate` 取代。所有 `xlnk.cma_array(...)` 改为 `allocate(...)`，释放改为 `.freebuffer()`。
+From PYNQ v2.7, `pynq.Xlnk` is replaced by `pynq.allocate`. Every `xlnk.cma_array(...)` becomes `allocate(...)`, and deallocation becomes `.freebuffer()`.
 
-### 权重数组尺寸不匹配
+### Weight array dimensions do not match
 
-原版 notebook 声明的是 `1181 / 46 / 123` 块，但当前 HLS 源码的顶层函数（`net_hls.h`）声明的是：
+The original notebook declares `1181 / 46 / 123` tiles, but the top-level function in the current HLS source (`net_hls.h`) declares:
 
 ```c
 FIX_16_1 fix_conv_weight_1x1_all[405][16][16],
@@ -127,27 +129,27 @@ FIX_16_1 fix_conv_weight_3x3_all[22][16][3][3],
 FIX_16_1 fix_bias_all[67][16],
 ```
 
-即 405 / 22 / 67，合计 107,920 个 uint16 = 215,840 字节。notebook 对应的是另一版网络配置，与本仓库构建出的 bitstream 不配套，故按硬件接口改写。
+That is 405 / 22 / 67 tiles — 107,920 uint16 values, or 215,840 bytes. The notebook corresponds to a different network configuration and does not match the bitstream built here, so it was rewritten against the hardware interface.
 
-### 竞赛框架依赖
+### Contest framework dependency
 
-原版依赖 DAC-SDC 的 `preprocessing.py`（`Agent`、`get_image_batch()`），该文件不在工程包内。改为读单张图片，去掉批处理与 XML 输出。
+The original depends on the DAC-SDC `preprocessing.py` (`Agent`, `get_image_batch()`), which is not part of the project package. Replaced with single-image inference, dropping the batch loop and XML output.
 
-`notebook/iSmart2_single.ipynb` 是改写后的版本，含完整运行输出。
+`notebook/iSmart2_single.ipynb` is the rewritten version, with full execution output included.
 
 ---
 
-## 权重重排链路
+## Weight Reordering Pipeline
 
-板上加载的权重不是原始训练权重，需经脉动阵列的分块重排：
+The weights loaded on board are not the raw trained weights — they must first be tiled for the systolic array:
 
 ```
-params_384_320_160_v2.bin   (419,448 B, float, 原始权重)
-        ↓  reorder_weight_fix()  —— 经 tb.cc 的 C 仿真触发
-params_384_fix.bin          (215,840 B, uint16, 405/22/67 块)
+params_384_320_160_v2.bin   (419,448 B, float, raw weights)
+        ↓  reorder_weight_fix()  —— triggered by the C simulation in tb.cc
+params_384_fix.bin          (215,840 B, uint16, 405/22/67 tiles)
 ```
 
-重排函数是 HLS testbench 的一部分，不单独编译。跑一次 C 仿真即可产出：
+The reordering function is part of the HLS testbench and is not compiled standalone. One C simulation run produces it:
 
 ```tcl
 open_project -reset csim_proj
@@ -167,19 +169,19 @@ csim_design
 exit
 ```
 
-`tb.cc` 的 `main()` 会读一张 `1.bin`（3×160×320 的裸 RGB，153,600 字节）。只要重排结果，内容无所谓，可以用全 127 的灰图占位。
+`main()` in `tb.cc` reads an image `1.bin` (raw RGB, 3×160×320, 153,600 bytes). Since only the reordering output matters, its content is irrelevant — a flat 127 grey image works as a placeholder.
 
-产物在 `csim_proj/solution1/csim/build/params_384_fix.bin`。
+The output lands at `csim_proj/solution1/csim/build/params_384_fix.bin`.
 
 ---
 
-## 板上运行
+## Running on the Board
 
-寄存器地址来自 HLS 生成的驱动头 `xmobilenet_hw.h`：
+Register offsets come from the HLS-generated driver header `xmobilenet_hw.h`:
 
-| 偏移 | 含义 |
+| Offset | Meaning |
 |---|---|
-| 0x00 | `ap_ctrl`（bit0 = ap_start，bit1 = ap_done，bit2 = ap_idle） |
+| 0x00 | `ap_ctrl` (bit0 = ap_start, bit1 = ap_done, bit2 = ap_idle) |
 | 0x10 | image_in_raw_pad |
 | 0x18 | conv_weight_1x1_all |
 | 0x20 | conv_weight_3x3_all |
@@ -189,35 +191,35 @@ exit
 | 0x40 | DDR_buf |
 | 0x48 | predict_box |
 
-板上需要四个文件（`.bit` 与 `.hwh` 必须同名，`Overlay()` 按 bit 文件名去找 hwh）：
+Four files are needed on the board (`.bit` and `.hwh` must share a base name — `Overlay()` locates the `.hwh` from the bitstream filename):
 
 ```
 iSmart2.bit
 iSmart2.hwh
-iSmart2.bin      ← 重排后的权重
+iSmart2.bin      ← reordered weights
 test.jpg
 ```
 
-PYNQ-Z1 直连电脑时板子固定 IP 为 `192.168.2.99`，主机网卡配 `192.168.2.1/24`，浏览器访问 `http://192.168.2.99:9090`。
+When the PYNQ-Z1 is connected directly to a host, the board's fixed IP is `192.168.2.99`; set the host NIC to `192.168.2.1/24` and open `http://192.168.2.99:9090`.
 
 ---
 
-## 目录
+## Layout
 
 ```
-notebook/   改写后的板上 host notebook（含运行输出）
-patches/    构建脚本的修复
-results/    时序与资源报告
+notebook/   rewritten on-board host notebook (with execution output)
+patches/    build script fixes
+results/    timing and utilization reports
 ```
 
 ---
 
-## 环境
+## Environment
 
-- Vivado 2018.2 WebPACK（Windows）
-- PYNQ-Z1 板卡，PYNQ 镜像 v3.0.1
-- 原工程：iSmart2，DAC-SDC 2018
+- Vivado 2018.2 WebPACK (Windows)
+- PYNQ-Z1 board, PYNQ image v3.0.1
+- Original project: iSmart2, DAC-SDC 2018
 
-## 声明
+## Disclaimer
 
-原始 HLS 源码、训练权重与网络设计归 iSmart2 原作者所有，不在本仓库内分发。此处仅为复现过程记录与我自己所做修改。
+The original HLS sources, trained weights and network design belong to the iSmart2 authors and are not redistributed in this repository. What is here is a record of the reproduction process and the modifications I made.
